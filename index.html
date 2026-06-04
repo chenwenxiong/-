@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>发光粒子星球 - 手势控制</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #000010;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+    #canvas3d {
+      display: block;
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+    }
+    #inputVideo {
+      display: none;
+      position: absolute;
+      top: 0; left: 0;
+      width: 1px; height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    #hint {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255,255,255,0.45);
+      font-size: 13px;
+      letter-spacing: 0.5px;
+      pointer-events: none;
+      z-index: 10;
+      transition: opacity 0.8s;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 隐藏摄像头画布，供MediaPipe抓取帧 -->
+  <video id="inputVideo" playsinline autoplay muted></video>
+
+  <!-- Three.js 渲染目标 -->
+  <canvas id="canvas3d"></canvas>
+
+  <!-- 底部手势状态提示 -->
+  <div id="hint">正在初始化摄像头…</div>
+
+  <!-- ==================== 依赖库 CDN 引入 ==================== -->
+  <!-- Three.js r160 (UMD 全局脚本方式) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js">
+  </script>
+
+  <!-- MediaPipe Camera 工具 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js">
+  </script>
+
+  <!-- MediaPipe Hands 手部识别 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js">
+  </script>
+
+  <script>
+  (function() {
+    "use strict";
+
+    // ======================== DOM 引用 ========================
+    const canvas3d = document.getElementById("canvas3d");
+    const videoEl  = document.getElementById("inputVideo");
+    const hintEl   = document.getElementById("hint");
+
+    // ======================== 全局状态 ========================
+    const PLANET_RADIUS = 3.0;           // 星球半径
+    const MIN_DISTANCE  = 3.8;           // 相机距球心最近距离
+    const MAX_DISTANCE  = 18.0;          // 相机距球心最远距离
+    const INIT_DISTANCE = 8.5;           // 初始距离
+
+    // 手势平滑后的状态
+    let smoothHandScale   = 0.25;        // 手部尺寸 EMA
+    let smoothHandAngle   = 0;           // 手部旋转角 EMA
+    let prevHandAngle     = null;        // 上一帧手部角度 (用于计算增量)
+
+    // 手势类型: "neutral" | "fist" | "open"
+    let gestureType       = "neutral";
+    let gestureStableCount = 0;          // 手势稳定计数 (防抖)
+
+    // 变焦参考锚点
+    let zoomRefScale      = null;
+    let zoomRefDist       = null;
+
+    // 相机球坐标
+    let cameraTheta       = 0;           // 方位角
+    let cameraDistance    = INIT_DISTANCE;
+    let targetTheta       = 0;
+    let targetDistance    = INIT_DISTANCE;
+    const CAMERA_PHI      = Math.PI / 3; // 极角 (约60°俯视)
+
+    // ======================== Three.js 初始化 ========================
+    const renderer = new THREE.WebGLRenderer({ canvas: canvas3d, antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000010);
+
+    const scene    = new THREE.Scene();
+    const camera   = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.3, 80);
+    // 初始相机定位: 球坐标 → 直角坐标 (极角60°, 方位角0°, 距离INIT_DISTANCE)
+    camera.position.set(
+      INIT_DISTANCE * Math.sin(CAMERA_PHI) * Math.cos(0),
+      INIT_DISTANCE * Math.cos(CAMERA_PHI),
+      INIT_DISTANCE * Math.sin(CAMERA_PHI) * Math.sin(0)
+    );
+    camera.lookAt(0, 0, 0);
+
+    // ======================== 发光纹理生成 ========================
+    function createGlowTexture(innerColor, outerColor, size) {
+      const c = document.createElement("canvas");
+      c.width = size; c.height = size;
+      const ctx = c.getContext("2d");
+      const half = size / 2;
+      const grad = ctx.createRadialGradient(half, half, 0, half, half, half);
+      grad.addColorStop(0,   innerColor);
+      grad.addColorStop(0.15, innerColor);
+      grad.addColorStop(0.5,  innerColor);
+      grad.addColorStop(1,   outerColor);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, size, size);
+      const tex = new THREE.CanvasTexture(c);
+      tex.needsUpdate = true;
+      return tex;
+    }
+
+    // 橙色发光 (星球)
+    const glowTexOrange = createGlowTexture(
+      "rgba(255,120,20,1)", "rgba(255,60,0,0)", 128
+    );
+    // 白色发光 (星环 / 星空)
+    const glowTexWhite = createGlowTexture(
+      "rgba(255,255,255,1)", "rgba(200,220,255,0)", 128
+    );
+    // 柔和橙色 (星球内层填充)
+    const glowTexSoft = createGlowTexture(
+      "rgba(255,160,60,0.9)", "rgba(255,80,0,0)", 128
+    );
+
+    // ======================== 星球粒子 ========================
+    const planetGroup = new THREE.Group();
+    scene.add(planetGroup);
+
+    /* -- 表面高亮粒子 (Fibonacci 均匀球面 + 薄壳厚度) -- */
+    function buildSurfaceParticles(count, radius, thickness, tex, colorHex, baseSize) {
+      const pos = new Float32Array(count * 3);
+      const phi = Math.PI * (3 - Math.sqrt(5));   // 黄金角
+      for (let i = 0; i < count; i++) {
+        const y  = 1 - (i / (count - 1)) * 2;       // [-1, 1]
+        const rAtY = Math.sqrt(1 - y * y);
+        const theta = phi * i;
+        const nx = Math.cos(theta) * rAtY;
+        const nz = Math.sin(theta) * rAtY;
+        const ny = y;
+        const r  = radius + (Math.random() - 0.5) * thickness;
+        pos[i * 3]     = nx * r;
+        pos[i * 3 + 1] = ny * r;
+        pos[i * 3 + 2] = nz * r;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      const mat = new THREE.PointsMaterial({
+        map: tex,
+        size: baseSize,
+        color: new THREE.Color(colorHex),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: true,
+        transparent: true,
+        sizeAttenuation: true,
+      });
+      return new THREE.Points(geo, mat);
+    }
+
+    /* -- 内部填充粒子 (均匀随机 + 向表面偏置) -- */
+    function buildFillParticles(count, radius, tex, colorHex, baseSize) {
+      const pos = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        // 偏向表面: u∈[0.7,1] → 大部分在球壳外侧
+        const u = 0.7 + Math.random() * 0.3;
+        const r = radius * u;
+        const theta = Math.random() * Math.PI * 2;
+        const phi2  = Math.acos(2 * Math.random() - 1);
+        pos[i * 3]     = r * Math.sin(phi2) * Math.cos(theta);
+        pos[i * 3 + 1] = r * Math.cos(phi2);
+        pos[i * 3 + 2] = r * Math.sin(phi2) * Math.sin(theta);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      const mat = new THREE.PointsMaterial({
+        map: tex,
+        size: baseSize,
+        color: new THREE.Color(colorHex),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: true,
+        transparent: true,
+        sizeAttenuation: true,
+      });
+      return new THREE.Points(geo, mat);
+    }
+
+    // 表面: 6000 粒子, 薄壳 ±0.12
+    const surfacePts = buildSurfaceParticles(6000, PLANET_RADIUS, 0.12, glowTexOrange, "#ff6a10", 0.13);
+    planetGroup.add(surfacePts);
+
+    // 填充: 2500 粒子
+    const fillPts = buildFillParticles(2500, PLANET_RADIUS, glowTexSoft, "#ff8030", 0.07);
+    planetGroup.add(fillPts);
+
+    // 大气层光晕: 1500 粒子, 半径略大
+    const haloPts = buildSurfaceParticles(1500, PLANET_RADIUS + 0.25, 0.2, glowTexSoft, "#ff9030", 0.18);
+    planetGroup.add(haloPts);
+
+    // ======================== 星环粒子 ========================
+    function buildRing(count, innerR, outerR, colorHex, size) {
+      const pos = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        // 径向用高斯偏置让环中部更密
+        const rr = innerR + (outerR - innerR) * (0.35 + Math.random() * 0.65);
+        const y  = (Math.random() - 0.5) * 0.15; // 薄环
+        pos[i * 3]     = Math.cos(angle) * rr;
+        pos[i * 3 + 1] = y;
+        pos[i * 3 + 2] = Math.sin(angle) * rr;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      const mat = new THREE.PointsMaterial({
+        map: glowTexWhite,
+        size: size,
+        color: new THREE.Color(colorHex),
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: true,
+        transparent: true,
+        sizeAttenuation: true,
+      });
+      const ring = new THREE.Points(geo, mat);
+      return ring;
+    }
+
+    // 内环: 2500 粒子, 半径 3.5~5.0, 倾斜 12°
+    const ring1 = buildRing(2500, 3.5, 5.0, "#ffffff", 0.14);
+    ring1.rotation.x = 0.21;  // ~12°
+    ring1.rotation.z = 0.08;
+    planetGroup.add(ring1);
+
+    // 外环: 2000 粒子, 半径 4.8~6.2, 倾斜 -18°
+    const ring2 = buildRing(2000, 4.8, 6.2, "#e8f0ff", 0.16);
+    ring2.rotation.x = -0.31; // ~-18°
+    ring2.rotation.z = -0.12;
+    planetGroup.add(ring2);
+
+    // ======================== 星空背景 ========================
+    function buildStarfield(count, spread) {
+      const pos = new Float32Array(count * 3);
+      const col = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        // 均匀分布在以原点为中心的薄壳大球上
+        const theta = Math.random() * Math.PI * 2;
+        const phi2  = Math.acos(2 * Math.random() - 1);
+        const r = spread * (0.8 + Math.random() * 0.2);
+        pos[i * 3]     = Math.sin(phi2) * Math.cos(theta) * r;
+        pos[i * 3 + 1] = Math.sin(phi2) * Math.sin(theta) * r;
+        pos[i * 3 + 2] = Math.cos(phi2) * r;
+        // 蓝白冷色调
+        const brightness = 0.5 + Math.random() * 0.5;
+        col[i * 3]     = 0.7 * brightness + 0.3;
+        col[i * 3 + 1] = 0.75 * brightness + 0.25;
+        col[i * 3 + 2] = 1.0 * brightness;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute("color",    new THREE.BufferAttribute(col, 3));
+      const mat = new THREE.PointsMaterial({
+        map: glowTexWhite,
+        size: 0.25,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: true,
+        transparent: true,
+        vertexColors: true,
+        sizeAttenuation: true,
+      });
+      return new THREE.Points(geo, mat);
+    }
+
+    scene.add(buildStarfield(3000, 50));
+
+    // ======================== MediaPipe 手势识别 ========================
+
+    /** 用 PIP 关节夹角判断手指弯直 (旋转不变, 比距离法更鲁棒)
+     *  MCP→PIP 与 PIP→TIP 两向量夹角:
+     *    cos ≈  1 → 手指伸直 (夹角≈0°)
+     *    cos ≈ -1 → 手指完全弯曲 (夹角≈180°)              */
+    function detectGesture(landmarks) {
+      if (!landmarks || landmarks.length < 21) return "neutral";
+
+      const mcps = [5, 9, 13, 17];  // 食指/中指/无名指/小指 MCP
+      const pips = [6, 10, 14, 18]; // PIP
+      const tips = [8, 12, 16, 20]; // TIP
+
+      let curled = 0, extended = 0;
+
+      for (let i = 0; i < 4; i++) {
+        const mcp = landmarks[mcps[i]];
+        const pip = landmarks[pips[i]];
+        const tip = landmarks[tips[i]];
+
+        const v1x = pip.x - mcp.x, v1y = pip.y - mcp.y;
+        const v2x = tip.x - pip.x, v2y = tip.y - pip.y;
+        const m1 = Math.hypot(v1x, v1y);
+        const m2 = Math.hypot(v2x, v2y);
+        if (m1 < 1e-6 || m2 < 1e-6) continue;
+
+        const cosA = (v1x * v2x + v1y * v2y) / (m1 * m2);
+        if (cosA < -0.15) curled++;     // 夹角 > ~98° → 弯曲
+        if (cosA >  0.55) extended++;   // 夹角 < ~57° → 伸直
+      }
+
+      if (curled >= 3)   return "fist";
+      if (extended >= 4) return "open";
+      return "neutral";
+    }
+
+    /** 计算手部在画面中的归一化尺寸 (越大 = 越贴近摄像头) */
+    function calcHandScale(landmarks) {
+      let minX = 1, maxX = 0, minY = 1, maxY = 0;
+      for (const lm of landmarks) {
+        if (lm.x < minX) minX = lm.x;
+        if (lm.x > maxX) maxX = lm.x;
+        if (lm.y < minY) minY = lm.y;
+        if (lm.y > maxY) maxY = lm.y;
+      }
+      return Math.hypot(maxX - minX, maxY - minY);
+    }
+
+    /** 手部旋转角度 (手腕→中指MCP 与垂直轴夹角) */
+    function calcHandAngle(landmarks) {
+      const wrist = landmarks[0];
+      const mcp9  = landmarks[9];
+      return Math.atan2(mcp9.x - wrist.x, -(mcp9.y - wrist.y));
+    }
+
+    // ======================== MediaPipe 结果回调 ========================
+    function onHandResults(results) {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const lm   = results.multiHandLandmarks[0];
+        const rawGesture = detectGesture(lm);
+        const rawScale   = calcHandScale(lm);
+        const rawAngle   = calcHandAngle(lm);
+
+        // 手势防抖: 快速确认 (2帧一致即切换, 减少延迟感)
+        if (rawGesture === gestureType) {
+          gestureStableCount = Math.min(gestureStableCount + 1, 5);
+        } else {
+          gestureStableCount = Math.max(gestureStableCount - 1, 0);
+          if (gestureStableCount <= 0) {
+            gestureType = rawGesture;
+            zoomRefScale = null;
+            zoomRefDist  = null;
+            gestureStableCount = 1;
+          }
+        }
+
+        // EMA 平滑滤波 (alpha 适中, 兼顾响应与稳定)
+        const alpha = 0.18;
+        smoothHandScale = smoothHandScale + alpha * (rawScale - smoothHandScale);
+        smoothHandAngle = smoothHandAngle + alpha * (rawAngle - smoothHandAngle);
+
+        // 更新提示文字
+        const labels = { fist: "握拳 — 相机远离", open: "张开 — 相机拉近", neutral: "旋转手掌 → 环绕星球" };
+        hintEl.textContent = labels[gestureType];
+      } else {
+        // 未检测到手 → 缓慢恢复
+        gestureType        = "neutral";
+        gestureStableCount = 0;
+        zoomRefScale       = null;
+        zoomRefDist        = null;
+        prevHandAngle      = null;
+        hintEl.textContent = "未检测到手部 — 自动旋转";
+        smoothHandScale += (0.25 - smoothHandScale) * 0.05;
+      }
+    }
+
+    // ======================== 相机轨道更新 ========================
+    function updateCamera() {
+      // --- 旋转：仅在手部存在且手势为 neutral 时累积角度增量 ---
+      if (gestureType === "neutral") {
+        if (prevHandAngle !== null) {
+          let delta = smoothHandAngle - prevHandAngle;
+          if (delta >  Math.PI) delta -= 2 * Math.PI;
+          if (delta < -Math.PI) delta += 2 * Math.PI;
+          targetTheta += delta * 2.5;
+        }
+        prevHandAngle = smoothHandAngle;
+      } else {
+        // 非旋转手势期间冻结角度基准，避免切回 neutral 时跳变
+        prevHandAngle = null;
+      }
+
+      // 无手势时缓慢自动公转
+      if (gestureType === "neutral" && prevHandAngle === null) {
+        targetTheta += 0.0015;
+      }
+
+      // --- 变焦 ---
+      if (gestureType === "fist" || gestureType === "open") {
+        // 建立变焦锚点 (手势刚切换时的状态)
+        if (zoomRefScale === null) {
+          zoomRefScale = smoothHandScale;
+          zoomRefDist  = cameraDistance;
+        }
+
+        const scaleDelta = gestureType === "fist"
+          ? zoomRefScale - smoothHandScale   // 手变小 → 正值
+          : smoothHandScale - zoomRefScale;  // 手变大 → 正值
+
+        const normDelta = Math.max(0, Math.min(1, scaleDelta / 0.25));
+
+        if (gestureType === "fist") {
+          // 握拳+远离 → 相机远离星球 (慢→快: easeInQuad)
+          const t = normDelta * normDelta;
+          targetDistance = zoomRefDist + (MAX_DISTANCE - zoomRefDist) * t;
+        } else {
+          // 张开+靠近 → 相机拉近星球 (快→慢: easeOutQuad)
+          const t = 1 - (1 - normDelta) * (1 - normDelta);
+          targetDistance = zoomRefDist - (zoomRefDist - MIN_DISTANCE) * t;
+        }
+      } else {
+        // 无手势 → 缓慢回弹
+        targetDistance = INIT_DISTANCE;
+      }
+
+      // 平滑插值
+      const lerpSpeedRot = 0.12;
+      const lerpSpeedD   = 0.08;
+      cameraTheta    += (targetTheta    - cameraTheta)    * lerpSpeedRot;
+      cameraDistance += (targetDistance - cameraDistance) * lerpSpeedD;
+
+      // 距离钳位
+      cameraDistance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, cameraDistance));
+
+      // 球坐标 → 直角坐标
+      const sp = Math.sin(CAMERA_PHI);
+      const cp = Math.cos(CAMERA_PHI);
+      camera.position.x = cameraDistance * sp * Math.cos(cameraTheta);
+      camera.position.y = cameraDistance * cp;
+      camera.position.z = cameraDistance * sp * Math.sin(cameraTheta);
+      camera.lookAt(0, 0, 0);
+    }
+
+    // ======================== 动画循环 ========================
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // 星球缓慢自转
+      planetGroup.rotation.y += 0.0015;
+
+      // 根据手势更新相机
+      updateCamera();
+
+      renderer.render(scene, camera);
+    }
+
+    // ======================== 窗口自适应 ========================
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener("resize", onResize, { passive: true });
+
+    // 移动端 orientation 变化也触发
+    window.addEventListener("orientationchange", () => {
+      setTimeout(onResize, 200);
+    }, { passive: true });
+
+    // ======================== 启动 ========================
+    function startMediaPipe() {
+      try {
+        const hands = new Hands({
+          locateFile: (file) =>
+            `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+        });
+
+        hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.7,
+          minTrackingConfidence: 0.5,
+        });
+
+        hands.onResults(onHandResults);
+
+        const cameraUtils = new Camera(videoEl, {
+          onFrame: async () => {
+            await hands.send({ image: videoEl });
+          },
+          width: 640,
+          height: 480,
+        });
+
+        cameraUtils.start().then(() => {
+          hintEl.textContent = "👋 旋转手掌 → 环绕星球  |  ✊ 握拳 → 远离  |  ✋ 张开 → 拉近";
+          console.log("MediaPipe 摄像头已启动");
+        }).catch((err) => {
+          console.warn("摄像头启动失败:", err);
+          hintEl.textContent = "摄像头未授权 — 星球将自动旋转展示";
+        });
+
+      } catch (e) {
+        console.warn("MediaPipe 初始化失败:", e);
+        hintEl.textContent = "手势模块加载失败 — 星球自动旋转展示";
+      }
+    }
+
+    // Three.js + 星空先渲染，MediaPipe 异步启动
+    animate();
+    startMediaPipe();
+
+    console.log("🚀 发光粒子星球已就绪");
+    console.log("   手势操作: 旋转手掌=环绕 | 握拳远离=zoom out | 张开靠近=zoom in");
+  })();
+  </script>
+</body>
+</html>
